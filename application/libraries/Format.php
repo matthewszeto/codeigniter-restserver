@@ -178,6 +178,13 @@ class Format {
             $data = $this->_data;
         }
 
+        // The name is concatenated into the document, so keep it a token.
+        $basenode = preg_replace('/[^a-z_\-0-9]/i', '', (string) $basenode);
+        if ($basenode === '' || preg_match('/^[0-9]/', $basenode))
+        {
+            $basenode = 'xml';
+        }
+
         if ($structure === NULL)
         {
             $structure = simplexml_load_string("<?xml version='1.0' encoding='utf-8'?><$basenode />");
@@ -206,7 +213,11 @@ class Format {
             }
 
             // replace anything not alpha numeric
-            $key = preg_replace('/[^a-z_\-0-9]/i', '', $key);
+            $key = preg_replace('/[^a-z_\-0-9]/i', '', (string) $key);
+            if ($key === '' || preg_match('/^[0-9]/', $key))
+            {
+                $key = 'item';
+            }
 
             if ($key === '_attributes' && (is_array($value) || is_object($value)))
             {
@@ -218,7 +229,18 @@ class Format {
 
                 foreach ($attributes as $attribute_name => $attribute_value)
                 {
-                    $structure->addAttribute($attribute_name, $attribute_value);
+                    $attribute_name = preg_replace('/[^a-z_\-0-9]/i', '', (string) $attribute_name);
+                    if ($attribute_name === '' || preg_match('/^[0-9]/', $attribute_name))
+                    {
+                        continue;
+                    }
+
+                    if (is_array($attribute_value) || is_object($attribute_value))
+                    {
+                        $attribute_value = json_encode($attribute_value);
+                    }
+
+                    $structure->addAttribute($attribute_name, $this->_stringify_cell($attribute_value));
                 }
             }
             // if there is another array found recursively call this function
@@ -232,6 +254,7 @@ class Format {
             else
             {
                 // add single node.
+                $value = $this->_stringify_cell($value);
                 $value = htmlspecialchars(html_entity_decode($value, ENT_QUOTES, 'UTF-8'), ENT_QUOTES, 'UTF-8');
 
                 $structure->addChild($key, $value);
@@ -264,7 +287,7 @@ class Format {
         }
 
         // Check if it's a multi-dimensional array
-        if (isset($data[0]) && count($data) !== count($data, COUNT_RECURSIVE))
+        if (isset($data[0]) && is_array($data[0]) && count($data) !== count($data, COUNT_RECURSIVE))
         {
             // Multi-dimensional array
             $headings = array_keys($data[0]);
@@ -279,15 +302,16 @@ class Format {
         // Load the table library
         $this->_CI->load->library('table');
 
-        $this->_CI->table->set_heading($headings);
+        $this->_CI->table->set_heading(array_map([$this, '_html_cell'], $headings));
 
         foreach ($data as $row)
         {
-            // Suppressing the "array to string conversion" notice
-            // Keep the "evil" @ here
-            $row = @array_map('strval', $row);
+            if (is_array($row) === FALSE)
+            {
+                $row = [$row];
+            }
 
-            $this->_CI->table->add_row($row);
+            $this->_CI->table->add_row(array_map([$this, '_html_cell'], $row));
         }
 
         return $this->_CI->table->generate();
@@ -338,7 +362,7 @@ class Format {
         }
 
         // Check if it's a multi-dimensional array
-        if (isset($data[0]) && count($data) !== count($data, COUNT_RECURSIVE))
+        if (isset($data[0]) && is_array($data[0]) && count($data) !== count($data, COUNT_RECURSIVE))
         {
             // Multi-dimensional array
             $headings = array_keys($data[0]);
@@ -351,7 +375,7 @@ class Format {
         }
 
         // Apply the headings
-        fputcsv($handle, $headings, $delimiter, $enclosure);
+        fputcsv($handle, array_map([$this, '_csv_cell'], $headings), $delimiter, $enclosure);
 
         foreach ($data as $record)
         {
@@ -362,9 +386,7 @@ class Format {
                 break;
             }
 
-            // Suppressing the "array to string conversion" notice.
-            // Keep the "evil" @ here.
-            $record = @ array_map('strval', $record);
+            $record = array_map([$this, '_csv_cell'], $record);
 
             // Returns the length of the string written or FALSE
             fputcsv($handle, $record, $delimiter, $enclosure);
@@ -407,15 +429,31 @@ class Format {
         }
 
         // We only honour a jsonp callback which are valid javascript identifiers
-        elseif (preg_match('/^[a-z_\$][a-z0-9\$_]*(\.[a-z_\$][a-z0-9\$_]*)*$/i', $callback))
+        elseif (is_string($callback) && preg_match('/^[a-z_\$][a-z0-9\$_]*(\.[a-z_\$][a-z0-9\$_]*)*$/i', $callback))
         {
             // Return the data as encoded json with a callback
             return $callback.'('.json_encode($data).');';
         }
 
-        // An invalid jsonp callback function provided.
-        // Though I don't believe this should be hardcoded here
-        $data['warning'] = 'INVALID JSONP CALLBACK: '.$callback;
+        // Do not echo the rejected callback. Lists stay lists; only an
+        // object-shaped payload can carry a warning field.
+        if (is_array($data))
+        {
+            $string_key = FALSE;
+            foreach (array_keys($data) as $key)
+            {
+                if (is_string($key))
+                {
+                    $string_key = TRUE;
+                    break;
+                }
+            }
+
+            if ($string_key)
+            {
+                $data['warning'] = 'Invalid JSONP callback.';
+            }
+        }
 
         return json_encode($data);
     }
@@ -466,7 +504,37 @@ class Format {
      */
     protected function _from_xml($data)
     {
-        return $data ? (array) simplexml_load_string($data, 'SimpleXMLElement', LIBXML_NOCDATA) : [];
+        if (is_string($data) === FALSE || trim($data) === '')
+        {
+            return [];
+        }
+
+        // A doctype is how external entities and entity expansion are introduced.
+        if (preg_match('/<!DOCTYPE/i', $data))
+        {
+            throw new Exception('XML input must not declare a doctype.');
+        }
+
+        $previous_errors = libxml_use_internal_errors(TRUE);
+        $restore_loader = FALSE;
+        $previous_loader = NULL;
+        if (PHP_VERSION_ID < 80000 && function_exists('libxml_disable_entity_loader'))
+        {
+            $previous_loader = libxml_disable_entity_loader(TRUE);
+            $restore_loader = TRUE;
+        }
+
+        $xml = simplexml_load_string($data, 'SimpleXMLElement', LIBXML_NONET | LIBXML_NOCDATA);
+
+        if ($restore_loader)
+        {
+            libxml_disable_entity_loader($previous_loader);
+        }
+
+        libxml_clear_errors();
+        libxml_use_internal_errors($previous_errors);
+
+        return $xml ? (array) $xml : [];
     }
 
     /**
@@ -510,7 +578,44 @@ class Format {
      */
     protected function _from_serialize($data)
     {
-        return unserialize(trim($data));
+        if (is_string($data) === FALSE)
+        {
+            return [];
+        }
+
+        $data = trim($data);
+        if ($data === '')
+        {
+            return [];
+        }
+
+        if (PHP_VERSION_ID >= 70000)
+        {
+            $result = @unserialize($data, ['allowed_classes' => FALSE]);
+        }
+        else
+        {
+            // PHP 5 cannot disable classes. Refuse payloads that can construct one.
+            if (preg_match('/(?:^|[;{}])[OC]:\+?\d+:"/', $data))
+            {
+                throw new Exception('Serialized input must not contain objects.');
+            }
+
+            $result = @unserialize($data);
+        }
+
+        // serialize(FALSE) is the string "b:0;", which unserialize returns as FALSE.
+        if ($result === FALSE && $data !== 'b:0;')
+        {
+            return [];
+        }
+
+        if ($this->_contains_object($result))
+        {
+            throw new Exception('Serialized input must not contain objects.');
+        }
+
+        return $result;
     }
 
     /**
@@ -520,5 +625,82 @@ class Format {
     protected function _from_php($data)
     {
         return trim($data);
+    }
+
+    /**
+     * @param mixed $value
+     * @return bool
+     */
+    protected function _contains_object($value)
+    {
+        if (is_object($value))
+        {
+            return TRUE;
+        }
+
+        if (is_array($value))
+        {
+            foreach ($value as $item)
+            {
+                if ($this->_contains_object($item))
+                {
+                    return TRUE;
+                }
+            }
+        }
+
+        return FALSE;
+    }
+
+    /**
+     * @param mixed $value
+     * @return string
+     */
+    protected function _stringify_cell($value)
+    {
+        if (is_array($value) || is_object($value))
+        {
+            $encoded = json_encode($value);
+
+            return $encoded === FALSE ? '' : $encoded;
+        }
+
+        if ($value === NULL)
+        {
+            return '';
+        }
+
+        if (is_bool($value))
+        {
+            return $value ? '1' : '0';
+        }
+
+        return (string) $value;
+    }
+
+    /**
+     * @param mixed $value
+     * @return string
+     */
+    protected function _html_cell($value)
+    {
+        return htmlspecialchars($this->_stringify_cell($value), ENT_QUOTES, 'UTF-8');
+    }
+
+    /**
+     * Stop spreadsheet apps from treating a cell as a formula.
+     *
+     * @param mixed $value
+     * @return string
+     */
+    protected function _csv_cell($value)
+    {
+        $value = $this->_stringify_cell($value);
+        if ($value !== '' && preg_match('/^[=+\-@]/', $value) === 1 && is_numeric($value) === FALSE)
+        {
+            return "'".$value;
+        }
+
+        return $value;
     }
 }

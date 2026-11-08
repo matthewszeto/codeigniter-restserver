@@ -37,9 +37,15 @@ class Key extends REST_Controller {
         // Build a new key
         $key = $this->_generate_key();
 
-        // If no key level provided, provide a generic key
-        $level = $this->put('level') ? $this->put('level') : 1;
-        $ignore_limits = ctype_digit($this->put('ignore_limits')) ? (int) $this->put('ignore_limits') : 1;
+        // If no key level provided, provide a generic key. Never above the caller's own level.
+        $level = $this->_bounded_level($this->put('level'));
+        if ($level === NULL)
+        {
+            $level = $this->_bounded_level(1);
+        }
+
+        // Missing or non-numeric means "do not ignore limits". The old default was 1.
+        $ignore_limits = $this->_flag($this->put('ignore_limits'));
 
         // Insert the new key
         if ($this->_insert_key($key, ['level' => $level, 'ignore_limits' => $ignore_limits]))
@@ -97,7 +103,14 @@ class Key extends REST_Controller {
     public function level_post()
     {
         $key = $this->post('key');
-        $new_level = $this->post('level');
+        $new_level = $this->_bounded_level($this->post('level'));
+        if ($new_level === NULL)
+        {
+            $this->response([
+                'status' => FALSE,
+                'message' => 'Invalid key level'
+            ], REST_Controller::HTTP_BAD_REQUEST);
+        }
 
         // Does this key exist?
         if (!$this->_key_exists($key))
@@ -211,22 +224,74 @@ class Key extends REST_Controller {
 
     private function _generate_key()
     {
+        $length = (int) config_item('rest_key_length');
+        if ($length < 1)
+        {
+            $length = 40;
+        }
+
         do
         {
-            // Generate a random salt
-            $salt = base_convert(bin2hex($this->security->get_random_bytes(64)), 16, 36);
-
-            // If an error occurred, then fall back to the previous method
-            if ($salt === FALSE)
+            // base_convert() parses through a float and drops entropy on a long hex string.
+            $random = $this->security->get_random_bytes($length);
+            if ($random === FALSE)
             {
-                $salt = hash('sha256', time() . mt_rand());
+                $new_key = substr(hash('sha256', uniqid((string) mt_rand(), TRUE)), 0, $length);
             }
-
-            $new_key = substr($salt, 0, config_item('rest_key_length'));
+            else
+            {
+                $new_key = substr(bin2hex($random), 0, $length);
+            }
         }
         while ($this->_key_exists($new_key));
 
         return $new_key;
+    }
+
+    /**
+     * Integer level, capped at the authenticated caller's level when we know it.
+     *
+     * @param mixed $level
+     * @return int|NULL NULL when the submitted value is not a number
+     */
+    private function _bounded_level($level)
+    {
+        if (is_int($level) === FALSE && (is_string($level) === FALSE || is_numeric($level) === FALSE))
+        {
+            return NULL;
+        }
+
+        $level = (int) $level;
+        if ($level < 0)
+        {
+            $level = 0;
+        }
+
+        if (isset($this->rest->level) && is_numeric($this->rest->level) && $level > (int) $this->rest->level)
+        {
+            $level = (int) $this->rest->level;
+        }
+
+        return $level;
+    }
+
+    /**
+     * @param mixed $value
+     * @return int 1 or 0
+     */
+    private function _flag($value)
+    {
+        if (is_int($value))
+        {
+            return $value > 0 ? 1 : 0;
+        }
+
+        if (is_string($value) && ctype_digit($value))
+        {
+            return ((int) $value) > 0 ? 1 : 0;
+        }
+
+        return 0;
     }
 
     /* Private Data Methods */

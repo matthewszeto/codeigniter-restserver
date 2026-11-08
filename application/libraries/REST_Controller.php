@@ -436,6 +436,8 @@ abstract class REST_Controller extends CI_Controller {
         $this->request = new stdClass();
         $this->response = new stdClass();
         $this->rest = new stdClass();
+        // Early rejects (blacklist) run before output negotiation. Give them a format.
+        $this->response->format = $this->_get_default_output_format();
 
         // Check to see if the current IP address is blacklisted
         if ($this->config->item('rest_ip_blacklist_enabled') === TRUE)
@@ -485,7 +487,25 @@ abstract class REST_Controller extends CI_Controller {
         // Now we know all about our request, let's try and parse the body if it exists
         if ($this->request->format && $this->request->body)
         {
-            $this->request->body = $this->format->factory($this->request->body, $this->request->format)->to_array();
+            if (empty($this->response->format))
+            {
+                $this->response->format = $this->_detect_output_format();
+            }
+
+            try
+            {
+                $parsed_body = $this->format->factory($this->request->body, $this->request->format)->to_array();
+            }
+            catch (Exception $ex)
+            {
+                // Unsafe XML or serialized bodies throw. Do not continue with an empty payload.
+                $this->response([
+                    $this->config->item('rest_status_field_name') => FALSE,
+                    $this->config->item('rest_message_field_name') => 'Unsupported request body'
+                ], self::HTTP_BAD_REQUEST);
+            }
+
+            $this->request->body = $parsed_body;
             // Assign payload arguments to proper method container
             $this->{'_'.$this->request->method.'_args'} = $this->request->body;
         }
@@ -552,7 +572,7 @@ abstract class REST_Controller extends CI_Controller {
             (! ($this->config->item('rest_enable_keys') && $this->_allow === TRUE) ||
             ($this->config->item('allow_auth_and_keys') === TRUE && $this->_allow === TRUE)))
         {
-            $rest_auth = strtolower($this->config->item('rest_auth'));
+            $rest_auth = strtolower((string) $this->config->item('rest_auth'));
             switch ($rest_auth)
             {
                 case 'basic':
@@ -565,10 +585,13 @@ abstract class REST_Controller extends CI_Controller {
                     $this->_check_php_session();
                     break;
             }
-            if ($this->config->item('rest_ip_whitelist_enabled') === TRUE)
-            {
-                $this->_check_whitelist_auth();
-            }
+        }
+
+        // A valid API key must not skip the whitelist. Overrides that already
+        // applied their own check (including "none") set auth_override to TRUE.
+        if ($this->auth_override === FALSE && $this->config->item('rest_ip_whitelist_enabled') === TRUE)
+        {
+            $this->_check_whitelist_auth();
         }
     }
 
@@ -657,14 +680,9 @@ abstract class REST_Controller extends CI_Controller {
                 $this->_log_request();
             }
             
-            // fix cross site to option request error 
-            if($this->request->method == 'options') {
-                exit;
-            }
-
             $this->response([
                     $this->config->item('rest_status_field_name') => FALSE,
-                    $this->config->item('rest_message_field_name') => sprintf($this->lang->line('text_rest_invalid_api_key'), $this->rest->key)
+                    $this->config->item('rest_message_field_name') => sprintf($this->lang->line('text_rest_invalid_api_key'), '')
                 ], self::HTTP_FORBIDDEN);
         }
 
@@ -743,9 +761,16 @@ abstract class REST_Controller extends CI_Controller {
                 throw $ex;
             }
 
-            // If the method doesn't exist, then the error will be caught and an error response shown
-	        $_error = &load_class('Exceptions', 'core');
-	        $_error->show_exception($ex);
+            $message = 'Internal server error';
+            if (defined('ENVIRONMENT') && ENVIRONMENT === 'development')
+            {
+                $message = $ex->getMessage();
+            }
+
+            $this->response([
+                    $this->config->item('rest_status_field_name') => FALSE,
+                    $this->config->item('rest_message_field_name') => $message
+                ], self::HTTP_INTERNAL_SERVER_ERROR);
         }
     }
 
@@ -760,7 +785,9 @@ abstract class REST_Controller extends CI_Controller {
      */
     public function response($data = NULL, $http_code = NULL, $continue = FALSE)
     {
-		ob_start();
+        $buffer_level = ob_get_level();
+        ob_start();
+
         // If the HTTP status is not NULL, then cast as an integer
         if ($http_code !== NULL)
         {
@@ -813,6 +840,7 @@ abstract class REST_Controller extends CI_Controller {
         $http_code > 0 || $http_code = self::HTTP_OK;
 
         $this->output->set_status_header($http_code);
+        $this->output->set_header('X-Content-Type-Options: nosniff');
 
         // JC: Log response code only if rest logging enabled
         if ($this->config->item('rest_enable_logging') === TRUE)
@@ -823,18 +851,17 @@ abstract class REST_Controller extends CI_Controller {
         // Output the data
         $this->output->set_output($output);
 
+        while (ob_get_level() > $buffer_level)
+        {
+            ob_end_clean();
+        }
+
         if ($continue === FALSE)
         {
             // Display the data and exit execution
             $this->output->_display();
             exit;
         }
-		else
-		{
-			ob_end_flush();
-		}
-
-        // Otherwise dump the output automatically
     }
 
     /**
@@ -935,29 +962,38 @@ abstract class REST_Controller extends CI_Controller {
         // Otherwise, check the HTTP_ACCEPT server variable
         if ($this->config->item('rest_ignore_http_accept') === FALSE && $http_accept !== NULL)
         {
-            // Check all formats against the HTTP_ACCEPT header
-            foreach (array_keys($this->_supported_formats) as $format)
+            // Match format names, but keep the longest one. "php" is a substring of
+            // "application/vnd.php.serialized" and must not beat "serialized".
+            // A browser Accept lists both html and xml; ignore that pair and use the default.
+            $matched = [];
+            $order = [];
+            foreach (array_keys($this->_supported_formats) as $index => $format)
             {
-                // Has this format been requested?
+                $order[$format] = $index;
                 if (strpos($http_accept, $format) !== FALSE)
                 {
-                    if ($format !== 'html' && $format !== 'xml')
-                    {
-                        // If not HTML or XML assume it's correct
-                        return $format;
-                    }
-                    elseif ($format === 'html' && strpos($http_accept, 'xml') === FALSE)
-                    {
-                        // HTML or XML have shown up as a match
-                        // If it is truly HTML, it wont want any XML
-                        return $format;
-                    }
-                    else if ($format === 'xml' && strpos($http_accept, 'html') === FALSE)
-                    {
-                        // If it is truly XML, it wont want any HTML
-                        return $format;
-                    }
+                    $matched[] = $format;
                 }
+            }
+
+            if (in_array('html', $matched, TRUE) && in_array('xml', $matched, TRUE))
+            {
+                $matched = array_values(array_diff($matched, ['html', 'xml']));
+            }
+
+            if (empty($matched) === FALSE)
+            {
+                usort($matched, function ($left, $right) use ($order) {
+                    $by_length = strlen($right) - strlen($left);
+                    if ($by_length !== 0)
+                    {
+                        return $by_length;
+                    }
+
+                    return $order[$left] - $order[$right];
+                });
+
+                return $matched[0];
             }
         }
 
@@ -1120,13 +1156,20 @@ abstract class REST_Controller extends CI_Controller {
      */
     protected function _log_request($authorized = FALSE)
     {
+        $params = NULL;
+        if ($this->_args)
+        {
+            $safe_args = $this->_redact_log_params($this->_args);
+            $params = $this->config->item('rest_logs_json_params') === TRUE ? json_encode($safe_args) : serialize($safe_args);
+        }
+
         // Insert the request into the log table
         $is_inserted = $this->rest->db
             ->insert(
                 $this->config->item('rest_logs_table'), [
                 'uri' => $this->uri->uri_string(),
                 'method' => $this->request->method,
-                'params' => $this->_args ? ($this->config->item('rest_logs_json_params') === TRUE ? json_encode($this->_args) : serialize($this->_args)) : NULL,
+                'params' => $params,
                 'api_key' => isset($this->rest->key) ? $this->rest->key : '',
                 'ip_address' => $this->input->ip_address(),
                 'time' => time(),
@@ -1137,6 +1180,48 @@ abstract class REST_Controller extends CI_Controller {
         $this->_insert_id = $this->rest->db->insert_id();
 
         return $is_inserted;
+    }
+
+    /**
+     * Remove credentials from the parameter dump written to the log table.
+     * The api_key column still records which key was used.
+     *
+     * @access protected
+     * @param mixed $params
+     * @return mixed
+     */
+    protected function _redact_log_params($params)
+    {
+        if (is_array($params) === FALSE)
+        {
+            return $params;
+        }
+
+        $secret_keys = [
+            strtolower((string) $this->config->item('rest_key_name')),
+            'authorization',
+            'proxy-authorization',
+            'php-auth-pw',
+            'php-auth-user',
+            'cookie',
+            'password',
+            'passwd',
+            'x-api-key',
+        ];
+
+        $redacted = [];
+        foreach ($params as $key => $value)
+        {
+            if (in_array(strtolower((string) $key), $secret_keys, TRUE))
+            {
+                $redacted[$key] = '[redacted]';
+                continue;
+            }
+
+            $redacted[$key] = is_array($value) ? $this->_redact_log_params($value) : $value;
+        }
+
+        return $redacted;
     }
 
     /**
@@ -1190,7 +1275,11 @@ abstract class REST_Controller extends CI_Controller {
         }
 
         // How many times can you get to this method in a defined time_limit (default: 1 hour)?
-        $limit = $this->methods[$controller_method]['limit'];
+        $limit = (int) $this->methods[$controller_method]['limit'];
+        if ($limit < 1)
+        {
+            return FALSE;
+        }
 
         $time_limit = (isset($this->methods[$controller_method]['time']) ? $this->methods[$controller_method]['time'] : 3600); // 3600 = 60 * 60
 
@@ -1211,10 +1300,12 @@ abstract class REST_Controller extends CI_Controller {
                 'count' => 1,
                 'hour_started' => time()
             ]);
+
+            return TRUE;
         }
 
         // Been a time limit (or by default an hour) since they called
-        elseif ($result->hour_started < (time() - $time_limit))
+        if ($result->hour_started < (time() - $time_limit))
         {
             // Reset the started period and count
             $this->rest->db
@@ -1223,26 +1314,27 @@ abstract class REST_Controller extends CI_Controller {
                 ->set('hour_started', time())
                 ->set('count', 1)
                 ->update($this->config->item('rest_limits_table'));
+
+            return TRUE;
         }
 
-        // They have called within the hour, so lets update
-        else
+        // The limit has been exceeded
+        if ((int) $result->count >= $limit)
         {
-            // The limit has been exceeded
-            if ($result->count >= $limit)
-            {
-                return FALSE;
-            }
-
-            // Increase the count by one
-            $this->rest->db
-                ->where('uri', $limited_uri)
-                ->where('api_key', $api_key)
-                ->set('count', 'count + 1', FALSE)
-                ->update($this->config->item('rest_limits_table'));
+            return FALSE;
         }
 
-        return TRUE;
+        // Increase the count only while it is still under the limit.
+        // Overlapping requests serialize on the row, so the second one
+        // sees the updated count and changes nothing.
+        $this->rest->db
+            ->where('uri', $limited_uri)
+            ->where('api_key', $api_key)
+            ->where('count <', $limit)
+            ->set('count', 'count + 1', FALSE)
+            ->update($this->config->item('rest_limits_table'));
+
+        return $this->rest->db->affected_rows() > 0;
     }
 
     /**
@@ -1478,7 +1570,7 @@ abstract class REST_Controller extends CI_Controller {
             $this->request->body = $this->input->raw_input_stream;
             if ($this->request->format === 'json')
             {
-                $this->_put_args = json_decode($this->input->raw_input_stream);
+                $this->_put_args = json_decode($this->input->raw_input_stream, TRUE);
             }
         }
         else if ($this->input->method() === 'put')
@@ -1765,6 +1857,18 @@ abstract class REST_Controller extends CI_Controller {
             return FALSE;
         }
 
+        if ($password === NULL || $password === '')
+        {
+            log_message('error', 'LDAP Auth: empty password');
+            return FALSE;
+        }
+
+        if (function_exists('ldap_connect') === FALSE)
+        {
+            log_message('error', 'LDAP Auth: PHP LDAP extension is not available');
+            return FALSE;
+        }
+
         log_message('debug', 'LDAP Auth: Loading configuration');
 
         $this->config->load('ldap.php', TRUE);
@@ -1778,7 +1882,7 @@ abstract class REST_Controller extends CI_Controller {
             'basedn' => $this->config->item('basedn', 'ldap'),
         ];
 
-        log_message('debug', 'LDAP Auth: Connect to ' . (isset($ldaphost) ? $ldaphost : '[ldap not configured]'));
+        log_message('debug', 'LDAP Auth: Connect to ' . (isset($ldap['host']) ? $ldap['host'] : '[ldap not configured]'));
 
         // Connect to the ldap server
         $ldapconn = ldap_connect($ldap['host'], $ldap['port']);
@@ -1802,9 +1906,15 @@ abstract class REST_Controller extends CI_Controller {
 
             log_message('debug', 'LDAP Auth: bind successful');
         }
+        else
+        {
+            log_message('error', 'LDAP Auth: could not connect');
+            return FALSE;
+        }
 
-        // Search for user
-        if (($res_id = ldap_search($ldapconn, $ldap['basedn'], "uid=$username")) === FALSE)
+        // Search for user. Escape the username so it cannot change the filter.
+        $filter = 'uid='.$this->_ldap_filter_escape($username);
+        if (($res_id = ldap_search($ldapconn, $ldap['basedn'], $filter)) === FALSE)
         {
             log_message('error', 'LDAP Auth: User '.$username.' not found in search');
             return FALSE;
@@ -1842,6 +1952,28 @@ abstract class REST_Controller extends CI_Controller {
         ldap_close($ldapconn);
 
         return TRUE;
+    }
+
+    /**
+     * Escape a value for use in an LDAP search filter.
+     *
+     * @access protected
+     * @param string $value
+     * @return string
+     */
+    protected function _ldap_filter_escape($value)
+    {
+        $value = (string) $value;
+        if (function_exists('ldap_escape') && defined('LDAP_ESCAPE_FILTER'))
+        {
+            return ldap_escape($value, '', LDAP_ESCAPE_FILTER);
+        }
+
+        return str_replace(
+            ['\\', '*', '(', ')', "\x00"],
+            ['\\5c', '\\2a', '\\28', '\\29', '\\00'],
+            $value
+        );
     }
 
     /**
@@ -1898,17 +2030,31 @@ abstract class REST_Controller extends CI_Controller {
             return FALSE;
         }
 
-        $auth_source = strtolower($this->config->item('auth_source'));
-        $rest_auth = strtolower($this->config->item('rest_auth'));
+        $auth_source = strtolower((string) $this->config->item('auth_source'));
+        $rest_auth = strtolower((string) $this->config->item('rest_auth'));
         $valid_logins = $this->config->item('rest_valid_logins');
-
-        if ( ! $this->config->item('auth_source') && $rest_auth === 'digest')
+        if (is_array($valid_logins) === FALSE)
         {
-            // For digest we do not have a password passed as argument
-            return md5($username.':'.$this->config->item('rest_realm').':'.(isset($valid_logins[$username]) ? $valid_logins[$username] : ''));
+            $valid_logins = [];
         }
 
-        if ($password === FALSE)
+        // Digest verification asks for the stored HA1 (password === TRUE), not the plaintext password.
+        if ($password === TRUE && $rest_auth === 'digest' && $auth_source !== 'ldap')
+        {
+            if ($auth_source === 'library')
+            {
+                return $this->_perform_library_auth($username, TRUE);
+            }
+
+            if (array_key_exists($username, $valid_logins) === FALSE)
+            {
+                return FALSE;
+            }
+
+            return md5($username.':'.$this->config->item('rest_realm').':'.$valid_logins[$username]);
+        }
+
+        if ($password === FALSE || $password === NULL || $password === TRUE)
         {
             return FALSE;
         }
@@ -1932,12 +2078,40 @@ abstract class REST_Controller extends CI_Controller {
             return FALSE;
         }
 
-        if ($valid_logins[$username] !== $password)
+        return $this->_hash_equals((string) $valid_logins[$username], (string) $password);
+    }
+
+    /**
+     * Constant-time string compare. hash_equals() exists from PHP 5.6.
+     *
+     * @access protected
+     * @param string $known
+     * @param string $user
+     * @return bool
+     */
+    protected function _hash_equals($known, $user)
+    {
+        $known = (string) $known;
+        $user = (string) $user;
+
+        if (function_exists('hash_equals'))
+        {
+            return hash_equals($known, $user);
+        }
+
+        if (strlen($known) !== strlen($user))
         {
             return FALSE;
         }
 
-        return TRUE;
+        $result = 0;
+        $length = strlen($known);
+        for ($i = 0; $i < $length; $i++)
+        {
+            $result |= ord($known[$i]) ^ ord($user[$i]);
+        }
+
+        return $result === 0;
     }
 
     /**
@@ -1976,23 +2150,32 @@ abstract class REST_Controller extends CI_Controller {
             $this->_check_whitelist_auth();
         }
 
-        // Returns NULL if the SERVER variables PHP_AUTH_USER and HTTP_AUTHENTICATION don't exist
+        // Returns NULL if the SERVER variables PHP_AUTH_USER and Authorization don't exist
         $username = $this->input->server('PHP_AUTH_USER');
-        $http_auth = $this->input->server('HTTP_AUTHENTICATION');
-
         $password = NULL;
+
         if ($username !== NULL)
         {
             $password = $this->input->server('PHP_AUTH_PW');
         }
-        elseif ($http_auth !== NULL)
+        else
         {
-            // If the authentication header is set as basic, then extract the username and password from
-            // HTTP_AUTHORIZATION e.g. my_username:my_password. This is passed in the .htaccess file
-            if (strpos(strtolower($http_auth), 'basic') === 0)
+            // CGI and some FastCGI setups never fill PHP_AUTH_*. Read the raw header.
+            // Prefer HTTP_AUTHORIZATION; HTTP_AUTHENTICATION is the fallback name.
+            $http_auth = $this->input->server('HTTP_AUTHORIZATION');
+            if ($http_auth === NULL)
             {
-                // Search online for HTTP_AUTHORIZATION workaround to explain what this is doing
-                list($username, $password) = explode(':', base64_decode(substr($this->input->server('HTTP_AUTHORIZATION'), 6)));
+                $http_auth = $this->input->server('HTTP_AUTHENTICATION');
+            }
+
+            if (is_string($http_auth) && stripos($http_auth, 'basic ') === 0)
+            {
+                $decoded = base64_decode(substr($http_auth, 6), TRUE);
+                if (is_string($decoded) && strpos($decoded, ':') !== FALSE)
+                {
+                    // Split once so a password may contain colons.
+                    list($username, $password) = explode(':', $decoded, 2);
+                }
             }
         }
 
@@ -2025,13 +2208,13 @@ abstract class REST_Controller extends CI_Controller {
             $digest_string = $this->input->server('HTTP_AUTHORIZATION');
         }
 
-        $unique_id = uniqid();
+        $nonce = $this->_create_digest_nonce();
 
         // The $_SESSION['error_prompted'] variable is used to ask the password
         // again if none given or if the user enters wrong auth information
         if (empty($digest_string))
         {
-            $this->_force_login($unique_id);
+            $this->_force_login($nonce);
         }
 
         // We need to retrieve authentication data from the $digest_string variable
@@ -2039,25 +2222,149 @@ abstract class REST_Controller extends CI_Controller {
         preg_match_all('@(username|nonce|uri|nc|cnonce|qop|response)=[\'"]?([^\'",]+)@', $digest_string, $matches);
         $digest = (empty($matches[1]) || empty($matches[2])) ? [] : array_combine($matches[1], $matches[2]);
 
-        // For digest authentication the library function should return already stored md5(username:restrealm:password) for that username see rest.php::auth_library_function config
-        $username = $this->_check_login($digest['username'], TRUE);
-        if (array_key_exists('username', $digest) === FALSE || $username === FALSE)
+        foreach (['username', 'nonce', 'uri', 'nc', 'cnonce', 'qop', 'response'] as $field)
         {
-            $this->_force_login($unique_id);
+            if (isset($digest[$field]) === FALSE || $digest[$field] === '')
+            {
+                $this->_force_login($nonce);
+            }
         }
 
-        $md5 = md5(strtoupper($this->request->method).':'.$digest['uri']);
-        $valid_response = md5($username.':'.$digest['nonce'].':'.$digest['nc'].':'.$digest['cnonce'].':'.$digest['qop'].':'.$md5);
-
-        // Check if the string don't compare (case-insensitive)
-        if (strcasecmp($digest['response'], $valid_response) !== 0)
+        if (strtolower($digest['qop']) !== 'auth')
         {
-            // Display an error response
+            $this->_force_login($nonce);
+        }
+
+        if ($this->_valid_digest_nonce($digest['nonce']) === FALSE || $this->_digest_uri_matches_request($digest['uri']) === FALSE)
+        {
+            $this->_force_login($nonce);
+        }
+
+        // For digest authentication the library function should return already stored md5(username:restrealm:password) for that username see rest.php::auth_library_function config
+        $ha1 = $this->_check_login($digest['username'], TRUE);
+        if ($ha1 === FALSE)
+        {
+            $this->_force_login($nonce);
+        }
+
+        // Hash the method on the wire, not a verb supplied by method emulation.
+        $method = $this->input->server('REQUEST_METHOD');
+        if (is_string($method) === FALSE || $method === '')
+        {
+            $method = (string) $this->request->method;
+        }
+
+        $ha2 = md5(strtoupper($method).':'.$digest['uri']);
+        $valid_response = md5($ha1.':'.$digest['nonce'].':'.$digest['nc'].':'.$digest['cnonce'].':'.$digest['qop'].':'.$ha2);
+
+        if ($this->_hash_equals(strtolower($valid_response), strtolower($digest['response'])) === FALSE)
+        {
             $this->response([
                     $this->config->item('rest_status_field_name') => FALSE,
                     $this->config->item('rest_message_field_name') => $this->lang->line('text_rest_invalid_credentials')
                 ], self::HTTP_UNAUTHORIZED);
         }
+    }
+
+    /**
+     * Key for digest nonces. Prefer the application encryption key.
+     *
+     * @access protected
+     * @return string
+     */
+    protected function _digest_nonce_key()
+    {
+        $key = (string) $this->config->item('encryption_key');
+        if ($key === '')
+        {
+            $key = hash('sha256', APPPATH.'|'.(string) $this->config->item('rest_realm'));
+        }
+
+        return $key;
+    }
+
+    /**
+     * Nonce is timestamp:hmac so a client cannot invent one, and old ones expire.
+     *
+     * @access protected
+     * @return string
+     */
+    protected function _create_digest_nonce()
+    {
+        $time = time();
+
+        return $time.':'.hash_hmac('sha256', (string) $time, $this->_digest_nonce_key());
+    }
+
+    /**
+     * @access protected
+     * @param string $nonce
+     * @return bool
+     */
+    protected function _valid_digest_nonce($nonce)
+    {
+        if (is_string($nonce) === FALSE)
+        {
+            return FALSE;
+        }
+
+        $parts = explode(':', $nonce, 2);
+        if (count($parts) !== 2 || ctype_digit($parts[0]) === FALSE)
+        {
+            return FALSE;
+        }
+
+        $time = (int) $parts[0];
+        $now = time();
+        // One hour of replay, plus a minute of clock skew.
+        if ($time > $now + 60 || $time < $now - 3600)
+        {
+            return FALSE;
+        }
+
+        $expected = hash_hmac('sha256', (string) $time, $this->_digest_nonce_key());
+
+        return $this->_hash_equals($expected, $parts[1]);
+    }
+
+    /**
+     * The digest URI has to be the URI that was requested.
+     * Using the value from the header on its own would let one authorized
+     * request be replayed against a different path.
+     *
+     * @access protected
+     * @param string $uri
+     * @return bool
+     */
+    protected function _digest_uri_matches_request($uri)
+    {
+        if (is_string($uri) === FALSE || $uri === '')
+        {
+            return FALSE;
+        }
+
+        $request_uri = (string) $this->input->server('REQUEST_URI');
+        $candidates = [$request_uri];
+
+        $script = (string) $this->input->server('SCRIPT_NAME');
+        if ($script !== '' && strpos($request_uri, $script) === 0)
+        {
+            $stripped = substr($request_uri, strlen($script));
+            if ($stripped === '' || $stripped[0] === '/' || $stripped[0] === '?')
+            {
+                $candidates[] = $stripped === '' ? '/' : $stripped;
+            }
+        }
+
+        foreach ($candidates as $candidate)
+        {
+            if ($candidate !== '' && $this->_hash_equals($candidate, $uri))
+            {
+                return TRUE;
+            }
+        }
+
+        return FALSE;
     }
 
     /**
@@ -2090,9 +2397,11 @@ abstract class REST_Controller extends CI_Controller {
      */
     protected function _check_whitelist_auth()
     {
-        $whitelist = explode(',', $this->config->item('rest_ip_whitelist'));
+        $whitelist = explode(',', (string) $this->config->item('rest_ip_whitelist'));
 
-        array_push($whitelist, '127.0.0.1', '0.0.0.0');
+        // 0.0.0.0 is what CodeIgniter returns when the client address is missing
+        // or invalid. Treating it as loopback would let those requests through.
+        array_push($whitelist, '127.0.0.1', '::1');
 
         foreach ($whitelist as &$ip)
         {
@@ -2120,8 +2429,9 @@ abstract class REST_Controller extends CI_Controller {
      */
     protected function _force_login($nonce = '')
     {
-        $rest_auth = $this->config->item('rest_auth');
-        $rest_realm = $this->config->item('rest_realm');
+        $rest_auth = (string) $this->config->item('rest_auth');
+        $rest_realm = str_replace(["\r", "\n", '"'], '', (string) $this->config->item('rest_realm'));
+        $nonce = str_replace(["\r", "\n", '"'], '', (string) $nonce);
         if (strtolower($rest_auth) === 'basic')
         {
             // See http://tools.ietf.org/html/rfc2617#page-5
@@ -2129,6 +2439,11 @@ abstract class REST_Controller extends CI_Controller {
         }
         elseif (strtolower($rest_auth) === 'digest')
         {
+            if ($nonce === '')
+            {
+                $nonce = $this->_create_digest_nonce();
+            }
+
             // See http://tools.ietf.org/html/rfc2617#page-18
             header(
                 'WWW-Authenticate: Digest realm="'.$rest_realm
@@ -2152,6 +2467,11 @@ abstract class REST_Controller extends CI_Controller {
      */
     protected function _log_access_time()
     {
+        if ($this->_insert_id === '' || $this->_insert_id === NULL || isset($this->rest->db) === FALSE)
+        {
+            return FALSE;
+        }
+
         $payload['rtime'] = $this->_end_rtime - $this->_start_rtime;
 
         return $this->rest->db->update(
@@ -2170,6 +2490,11 @@ abstract class REST_Controller extends CI_Controller {
      */
     protected function _log_response_code($http_code)
     {
+        if ($this->_insert_id === '' || $this->_insert_id === NULL || isset($this->rest->db) === FALSE)
+        {
+            return FALSE;
+        }
+
         $payload['response_code'] = $http_code;
 
         return $this->rest->db->update(
@@ -2229,7 +2554,24 @@ abstract class REST_Controller extends CI_Controller {
     protected function _check_cors()
     {
         // Convert the config items into strings
-        $allowed_headers = implode(', ', $this->config->item('allowed_cors_headers'));
+        $allowed_headers = $this->config->item('allowed_cors_headers');
+        if (is_array($allowed_headers) === FALSE)
+        {
+            $allowed_headers = [];
+        }
+
+        $key_name = $this->config->item('rest_key_name');
+        if ($key_name && in_array($key_name, $allowed_headers, TRUE) === FALSE)
+        {
+            $allowed_headers[] = $key_name;
+        }
+
+        if (in_array('Authorization', $allowed_headers, TRUE) === FALSE)
+        {
+            $allowed_headers[] = 'Authorization';
+        }
+
+        $allowed_headers = implode(', ', $allowed_headers);
         $allowed_methods = implode(', ', $this->config->item('allowed_cors_methods'));
 
         // If we want to allow any domain to access the API
@@ -2253,6 +2595,7 @@ abstract class REST_Controller extends CI_Controller {
             if (in_array($origin, $this->config->item('allowed_cors_origins')))
             {
                 header('Access-Control-Allow-Origin: '.$origin);
+                header('Vary: Origin');
                 header('Access-Control-Allow-Headers: '.$allowed_headers);
                 header('Access-Control-Allow-Methods: '.$allowed_methods);
             }
