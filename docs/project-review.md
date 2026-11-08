@@ -18,6 +18,8 @@ The follow-up on this branch changes the items under "Fixes". Items under "Left 
 
 ## Fixes
 
+Each item is the defect as it stood on `b0229a1`. The paragraph that starts with "Fix" is the change on this branch.
+
 ### 1. Serialized request bodies can build PHP objects
 
 `Format::_from_serialize()` calls `unserialize()` on the raw body when `Content-Type` is `application/vnd.php.serialized`. That format is enabled by default. A payload that names a class already loaded in the app runs that class's wakeup path. This is PHP object injection.
@@ -147,4 +149,4 @@ Fix: delete that `exit`. Add `Authorization` and the configured key header to th
 
 ## Verification
 
-The follow-up commit adds `tests/format_security_test.php` for the format parser (object payloads, doctypes, XML names, HTML escaping, CSV formula prefixes, and JSONP callbacks) and syntax-checks the PHP with `php -l`. This repo does not contain CodeIgniter, so the controller changes cannot be exercised as HTTP requests from this tree.
+`tests/format_security_test.php` covers the format parser: object payloads, doctypes, XML names, HTML escaping, CSV formula prefixes, and JSONP callbacks. The PHP files were syntax-checked with `php -l`. This repo does not contain CodeIgniter, so the controller changes were not exercised as HTTP requests.

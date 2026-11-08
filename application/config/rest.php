@@ -125,8 +125,11 @@ $config['rest_auth'] = FALSE;
 |
 | Note: If 'rest_auth' is set to 'session' then change 'auth_source' to the name of the session variable
 |
+| Leave this empty to authenticate with rest_valid_logins. 'ldap' and 'library'
+| are opt-in. The previous default of 'ldap' ignored rest_valid_logins.
+|
 */
-$config['auth_source'] = 'ldap';
+$config['auth_source'] = '';
 
 /*
 |--------------------------------------------------------------------------
@@ -152,7 +155,7 @@ $config['allow_auth_and_keys'] = TRUE;
 | For digest authentication the library function should return already a stored
 | md5(username:restrealm:password) for that username
 |
-| e.g: md5('admin:REST API:1234') = '1e957ebc35631ab22d5bd6526bd14ea2'
+| e.g: md5('username:REST API:password')
 |
 */
 $config['auth_library_class'] = '';
@@ -210,7 +213,7 @@ $config['auth_library_function'] = '';
 | Array of usernames and passwords for login, if ldap is configured this is ignored
 |
 */
-$config['rest_valid_logins'] = ['admin' => '1234'];
+$config['rest_valid_logins'] = [];
 
 /*
 |--------------------------------------------------------------------------
@@ -249,7 +252,9 @@ $config['rest_handle_exceptions'] = TRUE;
 |
 | e.g: '123.456.789.0, 987.654.32.1'
 |
-| 127.0.0.1 and 0.0.0.0 are allowed by default
+| 127.0.0.1 and ::1 are allowed by default.
+| 0.0.0.0 is not. CodeIgniter uses 0.0.0.0 when the client address is missing
+| or invalid, and allowing it would bypass this list.
 |
 */
 $config['rest_ip_whitelist'] = '';
@@ -391,7 +396,7 @@ $config['rest_key_name'] = 'X-API-KEY';
 |   CREATE TABLE `logs` (
 |       `id` INT(11) NOT NULL AUTO_INCREMENT,
 |       `uri` VARCHAR(255) NOT NULL,
-|       `method` VARCHAR(6) NOT NULL,
+|       `method` VARCHAR(10) NOT NULL,
 |       `params` TEXT DEFAULT NULL,
 |       `api_key` VARCHAR(40) NOT NULL,
 |       `ip_address` VARCHAR(45) NOT NULL,
@@ -560,7 +565,9 @@ $config['allowed_cors_headers'] = [
   'X-Requested-With',
   'Content-Type',
   'Accept',
-  'Access-Control-Request-Method'
+  'Access-Control-Request-Method',
+  'Authorization',
+  'X-API-KEY'
 ];
 
 /*

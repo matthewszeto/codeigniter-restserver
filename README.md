@@ -112,10 +112,11 @@ public function index_post()
   }
 ```
 
-If you don't specify a response code, and the data you respond with `== FALSE` (an empty array or string, for instance), the response code will automatically be set to `404 Not Found`:
+If you pass `NULL` and do not specify a status code, the response is `404 Not Found`. An empty array or string is a real body and stays `200 OK` unless you set a status yourself:
 
 ```php
-$this->response([]); // HTTP 404 Not Found
+$this->response(NULL); // HTTP 404 Not Found
+$this->response([]);   // HTTP 200 OK with an empty JSON array
 ```
 
 ## Multilingual Support
@@ -148,7 +149,9 @@ You can enable basic authentication by setting the `$config['rest_auth']` to `'b
 $config['rest_valid_logins'] = ['username' => 'password', 'other_person' => 'secure123'];
 ```
 
-Enabling digest auth is similarly easy. Configure your desired logins in the config file like above, and set `$config['rest_auth']` to `'digest'`. The class will automatically send out the headers to enable digest auth.
+`$config['auth_source']` has to be empty for those config-file logins to be used. That is the default. Set it to `ldap` or `library` only when that backend should perform the check. Leave `rest_valid_logins` empty until you set a real password.
+
+Enabling digest auth is similarly easy. Configure your desired logins in the config file like above, and set `$config['rest_auth']` to `'digest'`. The class will automatically send out the headers to enable digest auth. The digest URI must be the request URI the server sees, and the nonce from the challenge expires after one hour. Set CodeIgniter's `encryption_key` so that nonce cannot be forged.
 
 If you're tying this library into an AJAX endpoint where clients authenticate using PHP sessions then you may not like either of the digest nor basic authentication methods. In that case, you can tell the REST Library what PHP session variable to check for. If the variable exists, then the user is authorized. It will be up to your application to set that variable. You can define the variable in ``$config['auth_source']``.  Then tell the library to use a php session variable by setting ``$config['rest_auth']`` to ``session``.
 
@@ -160,7 +163,7 @@ Any client connecting to your API will be checked against the white-listed IP ar
 $config['rest_ip_whitelist'] = '123.456.789.0, 987.654.32.1';
 ```
 
-Your localhost IPs (`127.0.0.1` and `0.0.0.0`) are allowed by default.
+Loopback addresses `127.0.0.1` and `::1` are allowed by default. `0.0.0.0` is not: CodeIgniter reports that value when the client address is missing or invalid, and treating it as local would let those requests through the whitelist.
 
 ## API Keys
 
